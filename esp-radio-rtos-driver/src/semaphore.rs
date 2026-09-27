@@ -723,13 +723,41 @@ mod implementation {
         /// task.
         fn take_with_deadline(&self, deadline: Option<u64>) -> bool {
             let deadline_instant = deadline.unwrap_or(u64::MAX);
+            let spin_start = now();
+
+            // Two guards against blob races that starve the give:
+            //
+            // 1. Each wait is re-armed for at most one second, so contexts
+            //    that sleep keep cycling - releasing the scheduling lock and
+            //    giving the give a chance to land, instead of parking on an
+            //    unbounded wait behind a lock.
+            // 2. Takes with a blocking (None) or far deadline bail out after
+            //    one second with `false`. Callers that cannot sleep spin at
+            //    interrupt priority for as long as the take is allowed to
+            //    run; with `u64::MAX` as the deadline that is unbounded -
+            //    observed as a ~9-minute full-system freeze in which the
+            //    RTOS timer tick handler itself stalled (one tick in nine
+            //    minutes), the scheduler stopped switching, and only code
+            //    free of scheduling locks kept running. Takes with a near
+            //    deadline (<= 10 s) keep their semantics: they are
+            //    legitimate bounded waits (handshakes, driver internals),
+            //    and failing those early turns reconnects into flap storms.
+            const WAIT_CAP_MICROS: u64 = 1_000_000;
+            const TAKE_BAIL_OUT_MICROS: u64 = 1_000_000;
+            const NEAR_DEADLINE_WINDOW_MICROS: u64 = 10_000_000;
+            let bail_budget = match deadline {
+                Some(d) if d <= spin_start + NEAR_DEADLINE_WINDOW_MICROS => u64::MAX,
+                _ => TAKE_BAIL_OUT_MICROS,
+            };
+
             loop {
                 let taken = self.inner.with(|sem| {
                     if sem.try_take() {
                         true
                     } else {
                         // The task will go to sleep when the above critical section is released.
-                        sem.wait_with_deadline(deadline);
+                        let capped = deadline.map(|d| d.min(now() + WAIT_CAP_MICROS));
+                        sem.wait_with_deadline(capped);
                         false
                     }
                 });
@@ -741,6 +769,11 @@ mod implementation {
 
                 if now() > deadline_instant {
                     debug!("Semaphore - take - timed out");
+                    return false;
+                }
+
+                if now() > bail_budget.saturating_add(spin_start) {
+                    debug!("Semaphore - take - bailed out after the take budget");
                     return false;
                 }
             }
